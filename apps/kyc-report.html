@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KYC AML Screening Report</title>
+<meta name="description" content="Upload a certificate of incorporation, run KYC extraction and OFAC sanctions screening on it, and read, save (HTML) or print to PDF the resulting KYC AML risk report; reopen any previously screened case.">
+<link rel="stylesheet" href="/api/v1/apps-runtime/v1/theme.css">
+<script src="/api/v1/apps-runtime/v1/embabel.js"></script>
+<script type="application/embabel-app+json">
+{"version":1,"name":"kyc-report","requires":{"lenses":["kyc-screen-certificate"],"views":["KycCases","KycCaseReport","SanctionsListsLoaded"],"realms":["kyc-aml"],"namespaces":[]}}
+</script>
+<style>
+  :root {
+    --bg: #0a0a0f; --surface: #13131a; --border: #1e1e2e; --cyan: #63c0f5; --purple: #9f77cd;
+    --green: #3fd73c; --dim: #6b7280; --text: #e5e7eb; --amber: #f2a93b; --red: #ef5350;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding-bottom: 48px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px; }
+  header.app { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; }
+  h1 { font-size: 1.5rem; margin: 0; }
+  h1 span { color: var(--cyan); }
+  .muted { color: var(--dim); }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; margin-top: 16px; }
+  .card h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  button, .button { background: var(--cyan); color: #06121a; border: 0; border-radius: 7px; padding: 8px 14px;
+                    font-weight: 600; cursor: pointer; font-size: 0.9rem; text-decoration: none; display: inline-block; }
+  button.secondary, .button.secondary { background: transparent; color: var(--cyan); border: 1px solid var(--cyan); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  input[type=file] { color: var(--text); }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
+          border: 1px solid var(--border); }
+  .lvl-HIGH, .rec-REJECT { background: rgba(239,83,80,.15); color: var(--red); border-color: rgba(239,83,80,.4); }
+  .lvl-MEDIUM, .rec-ENHANCED_DUE_DILIGENCE, .rec-MANUAL_REVIEW { background: rgba(242,169,59,.15); color: var(--amber); border-color: rgba(242,169,59,.4); }
+  .lvl-LOW, .rec-APPROVE, .rec-APPROVE_WITH_CONDITIONS { background: rgba(63,215,60,.12); color: var(--green); border-color: rgba(63,215,60,.35); }
+  .lvl-UNKNOWN { background: rgba(107,114,128,.15); color: #aab; }
+  .steps { list-style: none; padding: 0; margin: 10px 0 0; font-size: 0.9rem; }
+  .steps li { padding: 3px 0; }
+  .steps li.done::before { content: "✓ "; color: var(--green); }
+  .steps li.active::before { content: "… "; color: var(--cyan); }
+  .steps li.failed::before { content: "✗ "; color: var(--red); }
+  .error { color: var(--red); margin-top: 10px; white-space: pre-wrap; }
+  .notice { color: var(--amber); margin-top: 10px; }
+  table.cases { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  table.cases th, table.cases td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  table.cases th { color: var(--dim); font-weight: 600; }
+  .toolbar { position: sticky; top: 0; z-index: 5; background: var(--bg); padding: 10px 0; display: flex; flex-wrap: wrap; gap: 8px; }
+  #how-it-works { display: none; }
+  #how-it-works:target { display: block; }
+  #how-it-works pre { background: #0d0d14; border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+                      overflow-x: auto; font-size: 0.78rem; white-space: pre-wrap; }
+  footer.app { text-align: center; margin: 28px 0 8px; font-size: 0.8rem; }
+  footer.app a { color: var(--dim); }
+
+  /* ── the report: light "paper" so it prints and saves as a document, not a screenshot of the app ── */
+  .report { background: #fff; color: #1a1a1a; border-radius: 6px; padding: 36px 44px; margin-top: 8px;
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 10.5pt; line-height: 1.45; }
+  .report h1 { font-size: 20pt; margin: 0 0 4px; color: #111; }
+  .report h2 { font-size: 13pt; margin: 22px 0 8px; padding-bottom: 4px; border-bottom: 2px solid #1f3b57; color: #1f3b57; }
+  .report h3 { font-size: 11pt; margin: 14px 0 6px; color: #222; }
+  .report .meta { color: #555; font-size: 9.5pt; }
+  .report dl { display: grid; grid-template-columns: 200px 1fr; gap: 3px 14px; margin: 0; }
+  .report dt { color: #555; }
+  .report dd { margin: 0; }
+  .report table { width: 100%; border-collapse: collapse; margin: 6px 0 10px; font-size: 9.5pt; }
+  .report th, .report td { border: 1px solid #d5d9de; padding: 5px 7px; text-align: left; vertical-align: top; }
+  .report th { background: #eef2f6; }
+  .report td.num { text-align: right; white-space: nowrap; }
+  .report .badge { display: inline-block; padding: 1px 8px; border-radius: 4px; font-weight: 700; font-size: 9pt; border: 1px solid; }
+  .report .b-HIGH, .report .b-REJECT, .report .b-CONFIRMED_MATCH { color: #b3261e; border-color: #b3261e; background: #fdecea; }
+  .report .b-MEDIUM, .report .b-ENHANCED_DUE_DILIGENCE, .report .b-MANUAL_REVIEW, .report .b-POSSIBLE_MATCH, .report .b-MANUAL_REVIEW_REQUIRED { color: #8a5300; border-color: #c07a00; background: #fff4e0; }
+  .report .b-LOW, .report .b-APPROVE, .report .b-APPROVE_WITH_CONDITIONS, .report .b-CLEAR, .report .b-LIKELY_FALSE_POSITIVE { color: #1b6e20; border-color: #2e7d32; background: #e8f5e9; }
+  .report .b-UNKNOWN { color: #444; border-color: #888; background: #f1f1f1; }
+  .report .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 14px 0 4px; }
+  .report .summary div { border: 1px solid #d5d9de; border-radius: 6px; padding: 8px 10px; }
+  .report .summary .label { color: #555; font-size: 8.5pt; text-transform: uppercase; letter-spacing: .04em; }
+  .report .summary .value { font-size: 13pt; font-weight: 700; margin-top: 2px; }
+  .report .chart { display: flex; flex-wrap: wrap; align-items: center; gap: 22px; }
+  .report .legend div { font-size: 9pt; margin: 2px 0; }
+  .report .legend span.sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: middle; }
+  .report .note { color: #555; font-size: 9pt; }
+  .report .rationale { font-size: 9.5pt; color: #333; }
+  .report a { color: #1f5f9e; }
+  .report .candidate { border: 1px solid #d5d9de; border-radius: 6px; padding: 8px 12px; margin: 8px 0; page-break-inside: avoid; }
+
+  @media print {
+    body { background: #fff; padding: 0; }
+    body.print-report main > *:not(#report-wrap) { display: none !important; }
+    body.print-report #report-wrap .toolbar { display: none !important; }
+    body.print-report #embabel-badge { display: none !important; }
+    .report { border-radius: 0; padding: 0; margin: 0; }
+    .report h2 { page-break-after: avoid; }
+    .report table, .report .chart { page-break-inside: avoid; }
+    @page { margin: 16mm 14mm; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <header class="app">
+    <h1>KYC <span>AML</span> screening</h1>
+    <div id="list-status" class="muted">Checking which sanctions list is loaded…</div>
+  </header>
+
+  <section class="card" id="capability" hidden>
+    <h2>This world is missing something this app needs</h2>
+    <div id="capability-detail" class="error"></div>
+  </section>
+
+  <section class="card" id="upload-card">
+    <h2>1 · Upload a certificate of incorporation</h2>
+    <p class="muted">PDF, Word or text. The document is ingested into your Documents, then the KYC case is extracted from it,
+      screened against the loaded sanctions list, and scored. About 15–30 seconds.</p>
+    <div class="row">
+      <input type="file" id="file" accept=".pdf,.doc,.docx,.txt,.md,.html,.htm,.rtf,.odt">
+      <button id="run" disabled>Upload &amp; screen</button>
+      <button id="cancel" class="secondary" hidden>Cancel</button>
+    </div>
+    <ol class="steps" id="steps"></ol>
+    <embabel-operation-state id="screen-state"></embabel-operation-state>
+    <div id="screen-error" class="error" hidden></div>
+  </section>
+
+  <section class="card" id="cases-card">
+    <div class="row" style="justify-content:space-between">
+      <h2 style="margin:0">2 · Screened cases</h2>
+      <button id="refresh-cases" class="secondary">Refresh</button>
+    </div>
+    <embabel-operation-state id="cases-state"></embabel-operation-state>
+    <div id="cases"></div>
+  </section>
+
+  <section id="report-wrap" hidden>
+    <div class="toolbar">
+      <button id="save-html">Save as HTML</button>
+      <button id="save-pdf">Save as PDF</button>
+      <button id="close-report" class="secondary">Close report</button>
+      <span class="muted" style="align-self:center">PDF: choose “Save as PDF” as the destination in the print dialog.</span>
+    </div>
+    <embabel-operation-state id="report-state"></embabel-operation-state>
+    <div id="report-error" class="error" hidden></div>
+    <article class="report" id="report"></article>
+  </section>
+
+  <section class="card" id="how-it-works">
+    <h2>How it works</h2>
+    <h3>The data</h3>
+    <p>Everything comes from the <b>kyc-aml</b> realm in this world. The certificate you upload becomes a document in your
+      Documents (the same store as the Documents app). Screened cases are <code>KycCase</code> records and their sanctions
+      candidates are <code>ScreeningCandidate</code> records, both written by the screening lens. The sanctions list is the OFAC SDN
+      list, loaded from the published <code>sdn.xml</code> by the realm's <code>scripts/build-ofac-reference.py</code>; it is only as
+      current as that file. The header shows its publish date, read live from the <code>SanctionsListsLoaded</code> view.</p>
+    <h3>The questions</h3>
+    <ul>
+      <li><b>Upload</b> — <code>POST /api/v1/documents/upload</code> with the file (multipart field <code>file</code>). Its URI is
+        <code>upload://&lt;file name&gt;</code>.</li>
+      <li><b>Screen</b> — lens <code>kyc-screen-certificate</code>, parameter <code>document</code> = that URI. In order: reads the
+        document's text; an LLM maps it to a KycCase (legal name, registration number, ISO jurisdiction, incorporation date,
+        registered office, issuer, data-quality issues — only what the document states); <code>kyc.assessBaselineRisk</code> scores
+        pass 1; the name is fuzzy-matched against <i>every</i> OFAC record of the subject's type (primary names and aliases; token
+        overlap or edit distance, threshold 0.72) and country, registration number and date of birth are compared; an LLM
+        dispositions each candidate; <code>kyc.amendCase</code> recomputes pass 2; the case is saved. If the upload is still being
+        ingested the app waits a few seconds and asks again.</li>
+      <li><b>Case list</b> — view <code>KycCases</code> (limit 50): every screened case, newest first.</li>
+      <li><b>Report</b> — view <code>KycCaseReport</code>, parameter <code>caseId</code>: the stored case, both risk passes, the
+        screening result and the LLM's disposition, rendered here.</li>
+      <li><b>List status</b> — view <code>SanctionsListsLoaded</code>: list, publish date and record counts.</li>
+    </ul>
+    <p>Labels used in the report:</p>
+    <ul>
+      <li><b>Risk levels</b> score LOW 20, MEDIUM 55, HIGH 90, UNKNOWN 50. Weights: ownership 30; geography, source of funds,
+        source of wealth and AML/sanctions 15 each; document quality 10. Score = Σ(level score × weight) ÷ Σ weights.
+        Overall risk is conservative: HIGH if any factor is HIGH, else MEDIUM if any is MEDIUM, else UNKNOWN if any is UNKNOWN, else LOW.</li>
+      <li><b>Candidate disposition</b>: <i>possible match</i> until an analyst decides. <i>Confirmed</i> needs a near-exact name AND
+        a matching registration number or date of birth; <i>likely false positive</i> needs two conflicting identifiers.</li>
+      <li><b>Sanctions factor</b> after screening: HIGH for a confirmed match or LLM confidence ≥ 0.6, MEDIUM ≥ 0.4, LOW when
+        nothing matched.</li>
+    </ul>
+    <h3>When it looks wrong</h3>
+    <ul>
+      <li>“No screened cases yet” means the view ran and there are none. A red error means the call failed; the list may simply
+        not have been read.</li>
+      <li>A subject with blank registration number or jurisdiction means the document did not state them (they are flagged as
+        issues), not that the app lost them.</li>
+      <li>A CLEAR screen is only as current as the list's publish date in the header.</li>
+      <li>The policy numbers are demo calibration, not regulatory constants; the LLM disposition is advice, never a decision.</li>
+    </ul>
+    <h3>What made this possible</h3>
+    <p>The page calls one lens and three views by name when you ask; there is no backend of its own. Risk scoring and case
+      amendment run as the realm's sandboxed functions; the report is rendered here from the stored case, so reopening a case
+      shows exactly what was decided at the time rather than re-running it. “Save as HTML” writes this report with its styles
+      inlined; “Save as PDF” prints only the report.</p>
+  </section>
+
+  <footer class="app"><a href="#how-it-works">How it works</a></footer>
+</main>
+
+<script>
+(function () {
+  'use strict';
+
+  function escapeHtml(s) { return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const rowsOf = (env) => {
+    const d = env && env.data;
+    if (Array.isArray(d)) return d;
+    if (d && Array.isArray(d.rows)) return d.rows;
+    return [];
+  };
+  const parse = (text, fallback) => { try { return text ? JSON.parse(text) : fallback; } catch (e) { return fallback; } };
+  const human = (v) => String(v == null ? '' : v).replace(/_/g, ' ').toLowerCase().replace(/^./, (c) => c.toUpperCase());
+  const badge = (v) => v ? `<span class="badge b-${escapeHtml(v)}">${escapeHtml(human(v))}</span>` : '<span class="note">—</span>';
+  const pill = (cls, v) => v ? `<span class="pill ${cls}-${escapeHtml(v)}">${escapeHtml(human(v))}</span>` : '';
+  const fmt = (n, d) => (typeof n === 'number' && isFinite(n)) ? n.toFixed(d == null ? 2 : d) : escapeHtml(n == null ? '—' : n);
+  const or = (v) => (v == null || v === '' ? '—' : v);
+
+  const screenRunner = embabel.createRunner({ state: $('screen-state') });
+  const casesRunner = embabel.createRunner({ state: $('cases-state') });
+  const reportRunner = embabel.createRunner({ state: $('report-state') });
+  let current = null;       // the report on screen: { caseId, html, subject }
+  let uploadAbort = null;   // the in-flight upload, so Cancel / a new run can stop it
+  let runSeq = 0;
+
+  // ── capability preflight ─────────────────────────────────────────────────────────────────
+  async function preflight() {
+    try {
+      const m = await embabel.manifest.ready;
+      if (m && m.ok === false) {
+        const miss = m.missing || {};
+        const parts = ['lenses', 'views', 'realms', 'namespaces']
+          .filter((k) => (miss[k] || []).length).map((k) => `${k}: ${miss[k].join(', ')}`);
+        $('capability').hidden = false;
+        $('capability-detail').textContent = 'Missing ' + parts.join('; ') + '. Install or refresh the kyc-aml realm, then reload.';
+        return false;
+      }
+    } catch (e) {
+      $('capability').hidden = false;
+      $('capability-detail').textContent = 'Could not check this world’s capabilities: ' + (e.message || e);
+      return false;
+    }
+    return true;
+  }
+
+  // ── sanctions list status (header) ───────────────────────────────────────────────────────
+  async function loadListStatus() {
+    try {
+      const env = await embabel.views.invoke('SanctionsListsLoaded', {});
+      const rows = rowsOf(env);
+      if (!rows.length) {
+        $('list-status').innerHTML = '<span class="pill lvl-HIGH">No sanctions list loaded — screening cannot run</span>';
+        return;
+      }
+      const total = rows.reduce((n, r) => n + (Number(r.records) || 0), 0);
+      const lists = [...new Set(rows.map((r) => `${r.list} published ${r.published}`))];
+      $('list-status').textContent = `${lists.join('; ')} · ${total.toLocaleString()} records`;
+    } catch (e) {
+      $('list-status').innerHTML = `<span class="pill lvl-MEDIUM">Could not read the sanctions list status: ${escapeHtml(e.message || e)}</span>`;
+    }
+  }
+
+  // ── case list ────────────────────────────────────────────────────────────────────────────
+  async function loadCases(refresh) {
+    try {
+      const env = await casesRunner.view('KycCases', { limit: 50 }, { refresh: !!refresh });
+      if (!env) return null;
+      const rows = rowsOf(env);
+      if (!rows.length) {
+        $('cases').innerHTML = '<p class="muted">No screened cases yet. Upload a certificate above.</p>';
+        return rows;
+      }
+      $('cases').innerHTML = `<table class="cases"><thead><tr>
+          <th>Subject</th><th>Reg. no</th><th>Jur.</th><th>Baseline</th><th>Final</th><th>Recommendation</th><th>AML</th><th>Candidates</th><th>Screened</th><th></th>
+        </tr></thead><tbody>${rows.map((r) => `<tr>
+          <td>${escapeHtml(r.subject)}<div class="muted">${escapeHtml(r.document || '')}</div></td>
+          <td>${escapeHtml(or(r.registrationNumber))}</td>
+          <td>${escapeHtml(or(r.jurisdiction))}</td>
+          <td>${pill('lvl', r.baselineRisk)} ${escapeHtml(or(r.baselineScore))}</td>
+          <td>${pill('lvl', r.finalRisk)} ${escapeHtml(or(r.finalScore))}</td>
+          <td>${pill('rec', r.recommendation)}</td>
+          <td>${escapeHtml(human(r.amlStatus))}</td>
+          <td>${escapeHtml(or(r.sanctionsCandidates))}${r.primaryConcern ? `<div class="muted">${escapeHtml(r.primaryConcern)}</div>` : ''}</td>
+          <td class="muted">${escapeHtml(r.screenedAt ? new Date(r.screenedAt).toLocaleString() : '—')}</td>
+          <td><button class="secondary open-case" data-case="${escapeHtml(r.caseId)}">Open report</button></td>
+        </tr>`).join('')}</tbody></table>`;
+      return rows;
+    } catch (e) {
+      $('cases').innerHTML = `<p class="error">The case list failed to load: ${escapeHtml(e.message || e)}. This is a failed read, not an empty list.</p>`;
+      return null;
+    }
+  }
+  $('cases').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.open-case');
+    if (btn) openReport(btn.getAttribute('data-case'));
+  });
+  $('refresh-cases').addEventListener('click', () => loadCases(true));
+
+  // ── upload + screen ──────────────────────────────────────────────────────────────────────
+  const STEPS = ['Upload the document', 'Extract the KYC case and screen it against the sanctions list', 'Load the report'];
+  function setStep(i, status) {
+    $('steps').innerHTML = STEPS.map((s, n) =>
+      `<li class="${n < i ? 'done' : n === i ? status : ''}">${escapeHtml(s)}</li>`).join('');
+  }
+  function showScreenError(msg) { $('screen-error').hidden = false; $('screen-error').textContent = msg; }
+
+  $('file').addEventListener('change', () => { $('run').disabled = !$('file').files.length; });
+
+  $('cancel').addEventListener('click', () => {
+    runSeq++;
+    if (uploadAbort) uploadAbort.abort();
+    screenRunner.cancel();
+    $('cancel').hidden = true;
+    $('run').disabled = !$('file').files.length;
+    showScreenError('Cancelled.');
+  });
+
+  async function upload(file, myRun) {
+    const fd = new FormData();
+    fd.append('file', file, file.name);
+    uploadAbort = new AbortController();
+    const timer = setTimeout(() => uploadAbort.abort(), 180000);
+    try {
+      const r = await fetch('/api/v1/documents/upload', { method: 'POST', body: fd, credentials: 'include', signal: uploadAbort.signal });
+      if (!r.ok) {
+        let detail = '';
+        try { const b = await r.json(); detail = b.error || b.message || JSON.stringify(b); } catch (e) { detail = r.statusText; }
+        throw new Error(`Upload failed (${r.status}): ${detail}`);
+      }
+      const body = await r.json().catch(() => ({}));
+      if (body && (body.status === 'FAILED' || body.status === 'ERROR' || body.error)) {
+        throw new Error('Upload was not ingested: ' + (body.error || body.message || body.status));
+      }
+      if (myRun !== runSeq) return null;
+      return (body && (body.uri || body.documentUri)) || ('upload://' + file.name);
+    } catch (e) {
+      if (e.name === 'AbortError') throw new Error(myRun === runSeq ? 'The upload took too long and was stopped.' : 'Cancelled.');
+      throw e;
+    } finally {
+      clearTimeout(timer);
+      uploadAbort = null;
+    }
+  }
+
+  /* Ingestion can finish a moment after the upload returns; the lens then reports the document as
+     missing or empty. That is a wait, not a failure — ask again a few times before giving up. */
+  const NOT_READY = /No ingested document matches|has no text chunks/i;
+
+  async function screen(uri, myRun) {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const env = await screenRunner.lens('kyc-screen-certificate', { document: uri }, {
+          expectation: 'Reading the certificate, extracting the KYC case, screening every OFAC record of its type and asking the model to disposition any candidates — usually 15–30 seconds.'
+        });
+        return env; // null when superseded
+      } catch (e) {
+        if (myRun !== runSeq) return null;
+        if (attempt < 5 && NOT_READY.test(e.message || '')) { await sleep(3000); continue; }
+        throw e;
+      }
+    }
+  }
+
+  function caseIdFrom(env) {
+    const d = env && env.data;
+    const candidates = [d, d && d.content, d && d.presented, d && d.presentation, env && env.presented];
+    for (const c of candidates) {
+      if (!c) continue;
+      const v = typeof c === 'string' ? parse(c, null) : c;
+      if (v && typeof v.caseId === 'string') return v.caseId;
+    }
+    return null;
+  }
+
+  $('run').addEventListener('click', async () => {
+    const file = $('file').files[0];
+    if (!file) return;
+    const myRun = ++runSeq;
+    $('screen-error').hidden = true;
+    $('run').disabled = true;
+    $('cancel').hidden = false;
+    let step = 0;
+    try {
+      setStep(0, 'active');
+      const uri = await upload(file, myRun);
+      if (uri == null || myRun !== runSeq) return;
+      step = 1; setStep(1, 'active');
+      const env = await screen(uri, myRun);
+      if (!env || myRun !== runSeq) return;
+      step = 2; setStep(2, 'active');
+      let caseId = caseIdFrom(env);
+      const rows = await loadCases(true);
+      if (!caseId && rows) {
+        const mine = rows.find((r) => r.document === uri);
+        caseId = mine && mine.caseId;
+      }
+      if (!caseId) throw new Error('Screening finished but its case could not be found in the case list. Refresh the list and open it there.');
+      await openReport(caseId);
+      if (myRun === runSeq) setStep(3, 'done');
+    } catch (e) {
+      if (myRun !== runSeq) return;
+      setStep(step, 'failed');
+      showScreenError(e.message || String(e));
+    } finally {
+      if (myRun === runSeq) {
+        $('cancel').hidden = true;
+        $('run').disabled = !$('file').files.length;
+      }
+    }
+  });
+
+  // ── report ───────────────────────────────────────────────────────────────────────────────
+  const FACTOR_LABEL = {
+    GEOGRAPHY: 'Geography', OWNERSHIP: 'Ownership / control', DOCUMENT_QUALITY: 'Document quality',
+    SOURCE_OF_FUNDS: 'Source of funds', SOURCE_OF_WEALTH: 'Source of wealth', SANCTIONS: 'AML / sanctions',
+  };
+  const FACTOR_COLOR = {
+    GEOGRAPHY: '#4E79A7', OWNERSHIP: '#E15759', DOCUMENT_QUALITY: '#59A14F',
+    SOURCE_OF_FUNDS: '#F28E2B', SOURCE_OF_WEALTH: '#B07AA1', SANCTIONS: '#D37295',
+  };
+  const factorLabel = (t) => FACTOR_LABEL[t] || human(t);
+
+  function factorsTable(risk) {
+    const factors = (risk && risk.factors) || [];
+    if (!factors.length) return '<p class="note">No factors recorded.</p>';
+    return `<table><thead><tr><th style="width:22%">Category</th><th style="width:11%">Level</th><th>Rationale</th><th style="width:26%">Evidence</th></tr></thead><tbody>
+      ${factors.map((f) => `<tr><td>${escapeHtml(factorLabel(f.type))}</td><td>${badge(f.level)}</td>
+        <td class="rationale">${escapeHtml(f.rationale)}</td>
+        <td class="rationale">${f.evidence ? `${escapeHtml(f.evidence.documentId)}${typeof f.evidence.confidence === 'number' ? ` (confidence ${fmt(f.evidence.confidence)})` : ''}` : '<span class="note">—</span>'}</td></tr>`).join('')}
+    </tbody></table>`;
+  }
+
+  function scoreTable(risk) {
+    const rows = (risk && risk.breakdown) || [];
+    if (!rows.length) return '';
+    const totalPoints = rows.reduce((n, r) => n + r.weightedPoints, 0);
+    const totalWeight = rows.reduce((n, r) => n + r.weight, 0);
+    return `<table><thead><tr><th>Category</th><th>Level</th><th class="num">Level score</th><th class="num">Weight</th><th class="num">Weighted points</th></tr></thead><tbody>
+      ${rows.map((r) => `<tr><td>${escapeHtml(factorLabel(r.type))}</td><td>${badge(r.level)}</td><td class="num">${escapeHtml(r.levelScore)}</td><td class="num">${escapeHtml(r.weight)}</td><td class="num">${escapeHtml(r.weightedPoints)}</td></tr>`).join('')}
+      <tr><th colspan="3">Total</th><th class="num">${escapeHtml(totalWeight)}</th><th class="num">${escapeHtml(totalPoints)}</th></tr>
+      <tr><th colspan="4">Computed score = total weighted points ÷ total weight</th><th class="num">${escapeHtml(risk.score)}</th></tr>
+    </tbody></table>`;
+  }
+
+  function pieChart(risk) {
+    const rows = ((risk && risk.breakdown) || []).filter((r) => r.weightedPoints > 0);
+    const total = rows.reduce((n, r) => n + r.weightedPoints, 0);
+    if (!total) return '<p class="note">No weighted points to chart.</p>';
+    const cx = 80, cy = 80, rad = 72;
+    let angle = -Math.PI / 2;
+    const slices = rows.map((r) => {
+      const sweep = 2 * Math.PI * r.weightedPoints / total;
+      const x1 = cx + rad * Math.cos(angle), y1 = cy + rad * Math.sin(angle);
+      angle += sweep;
+      const x2 = cx + rad * Math.cos(angle), y2 = cy + rad * Math.sin(angle);
+      const large = sweep > Math.PI ? 1 : 0;
+      const color = FACTOR_COLOR[r.type] || '#76B7B2';
+      const d = rows.length === 1
+        ? `M ${cx - rad} ${cy} a ${rad} ${rad} 0 1 0 ${2 * rad} 0 a ${rad} ${rad} 0 1 0 ${-2 * rad} 0`
+        : `M ${cx} ${cy} L ${x1.toFixed(2)} ${y1.toFixed(2)} A ${rad} ${rad} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} Z`;
+      return { d, color, r };
+    });
+    return `<div class="chart">
+      <svg width="160" height="160" viewBox="0 0 160 160" role="img" aria-label="Final score composition">
+        ${slices.map((s) => `<path d="${s.d}" fill="${escapeHtml(s.color)}" stroke="#fff" stroke-width="1.5"></path>`).join('')}
+      </svg>
+      <div class="legend">${slices.map((s) => `<div><span class="sw" style="background:${escapeHtml(s.color)}"></span>${escapeHtml(factorLabel(s.r.type))}: ${(100 * s.r.weightedPoints / total).toFixed(1)}% (${escapeHtml(s.r.weightedPoints)} weighted points)</div>`).join('')}</div>
+    </div>`;
+  }
+
+  function ofacLink(hit) {
+    if (hit && hit.source === 'OFAC_SANCTIONS' && /^\d+$/.test(String(hit.sourceRecordId))) {
+      return `<a href="https://sanctionssearch.ofac.treas.gov/Details.aspx?id=${encodeURIComponent(hit.sourceRecordId)}" target="_blank" rel="noopener noreferrer">${escapeHtml(hit.entryId)}</a>`;
+    }
+    return escapeHtml(hit ? hit.entryId : '');
+  }
+
+  function address(a) {
+    return [a.line1, a.line2, a.city, a.region, a.postalCode, a.countryCode].filter(Boolean).join(', ');
+  }
+
+  function renderReport(row) {
+    const kyc = parse(row.caseJson, {});
+    const baseline = parse(row.baselineRiskJson, {});
+    const screening = parse(row.screeningJson, { hits: [] });
+    const aml = parse(row.amlAssessmentJson, { candidateAssessments: [] });
+    const compliance = parse(row.complianceJson, {});
+    const final = kyc.riskAssessment || {};
+    const s = kyc.subject || {};
+    const actions = compliance.complianceActions || {};
+    const merges = compliance.mergeDecisions || [];
+    const primary = compliance.primaryConcern;
+    const hits = screening.hits || [];
+    const assessments = aml.candidateAssessments || [];
+    const evidence = (kyc.evidence || [])[0] || {};
+    const generated = new Date();
+
+    const candidates = assessments.slice().sort((a, b) => (b.confidenceScore || 0) - (a.confidenceScore || 0)).map((c) => {
+      const h = hits.find((x) => String(x.sourceRecordId) === String(c.sourceRecordId)) || {};
+      const m = merges.find((x) => String(x.sourceRecordId) === String(c.sourceRecordId)) || {};
+      return `<div class="candidate">
+        <h3 style="margin-top:4px">${ofacLink(h)} · ${escapeHtml(h.primaryName || c.candidateName)}</h3>
+        <dl>
+          <dt>Matched alias / name</dt><dd>${escapeHtml(or(h.matchedName))}</dd>
+          <dt>List type · programs</dt><dd>${escapeHtml(or(h.sdnType))} · ${escapeHtml((h.programs || []).join(', ') || '—')}</dd>
+          <dt>List countries</dt><dd>${escapeHtml((h.countries || []).join(', ') || '—')}</dd>
+          <dt>List identifiers</dt><dd>${escapeHtml((h.identifiers || []).join(' ') || 'none listed')}</dd>
+          <dt>List addresses</dt><dd>${escapeHtml((h.addresses || []).join(' | ') || 'none listed')}</dd>
+          <dt>Matcher</dt><dd>name ${fmt(h.nameScore)} · identifiers ${fmt(h.identifierScore)} · conflicts: ${escapeHtml((h.conflicts || []).join(', ') || 'none')} · ${badge(h.disposition)}</dd>
+          <dt>LLM confidence</dt><dd>${fmt(c.confidenceScore)} ${badge(c.confidenceLevel)} → ${badge(c.recommendedDisposition)}</dd>
+          <dt>Merge treatment</dt><dd>${escapeHtml(or(m.treatment))}</dd>
+          <dt>Rationale</dt><dd class="rationale">${escapeHtml(c.rationale)}</dd>
+          <dt>Missing evidence</dt><dd class="rationale">${escapeHtml((c.missingEvidence || []).join('; ') || 'none stated')}</dd>
+        </dl></div>`;
+    }).join('');
+
+    const html = `
+      <h1>KYC AML Risk Pipeline Report</h1>
+      <div class="meta">Case <b>${escapeHtml(row.caseId)}</b> · screened ${escapeHtml(row.screenedAt ? new Date(row.screenedAt).toLocaleString() : '—')} · report generated ${escapeHtml(generated.toLocaleString())}</div>
+      <div class="meta">Input document: ${escapeHtml(or(row.documentName))} (${escapeHtml(or(row.documentUri))}) · Sanctions list: OFAC SDN published ${escapeHtml(or(row.listPublished))}</div>
+
+      <div class="summary">
+        <div><div class="label">Subject</div><div class="value" style="font-size:11pt">${escapeHtml(or(s.displayName))}</div></div>
+        <div><div class="label">Baseline risk</div><div class="value">${badge(baseline.overallRisk)} ${escapeHtml(or(baseline.score))}</div></div>
+        <div><div class="label">Final risk</div><div class="value">${badge(final.overallRisk)} ${escapeHtml(or(final.score))}</div></div>
+        <div><div class="label">Recommendation</div><div class="value">${badge(kyc.recommendation)}</div></div>
+        <div><div class="label">AML status</div><div class="value">${badge(row.amlStatus)}</div></div>
+      </div>
+
+      <h2>KYC subject</h2>
+      <dl>
+        <dt>Legal name</dt><dd>${escapeHtml(or(s.displayName))}</dd>
+        <dt>Registration number</dt><dd>${escapeHtml(or(s.registrationNumber))}</dd>
+        <dt>Jurisdiction</dt><dd>${escapeHtml(or(s.jurisdictionOfIncorporation))}</dd>
+        <dt>Incorporation date</dt><dd>${escapeHtml(or(s.incorporationDate))}</dd>
+        <dt>Registered office</dt><dd>${escapeHtml((s.addresses || []).map(address).join(' | ') || '—')}</dd>
+        <dt>Document</dt><dd>${escapeHtml(human(evidence.type))}${evidence.issuer ? ` · issued by ${escapeHtml(evidence.issuer)}` : ''}${evidence.issuePlace ? ` at ${escapeHtml(evidence.issuePlace)}` : ''}${evidence.issueDate ? ` on ${escapeHtml(evidence.issueDate)}` : ''}</dd>
+        <dt>Related parties</dt><dd>${escapeHtml((kyc.relatedParties || []).map((p) => `${p.displayName} (${(p.roles || []).join(', ')})`).join('; ') || 'none named in the document')}</dd>
+      </dl>
+      <h3>Data-quality issues</h3>
+      ${(kyc.issues || []).length ? `<table><thead><tr><th>Severity</th><th>Code</th><th>Message</th><th>Field</th></tr></thead><tbody>
+        ${kyc.issues.map((i) => `<tr><td>${escapeHtml(i.severity)}</td><td>${escapeHtml(i.code)}</td><td>${escapeHtml(i.message)}</td><td>${escapeHtml(i.fieldPath)}</td></tr>`).join('')}
+      </tbody></table>` : '<p class="note">None.</p>'}
+
+      <h2>Pass 1: Baseline KYC risk before AML</h2>
+      <p>Overall ${badge(baseline.overallRisk)} · score <b>${escapeHtml(or(baseline.score))}</b>. <span class="rationale">${escapeHtml(baseline.rationale || '')}</span></p>
+      <h3>Baseline risk factors by category</h3>
+      ${factorsTable(baseline)}
+      <h3>Cross-factor weighted score (baseline)</h3>
+      ${scoreTable(baseline)}
+
+      <h2>AML sanctions screening</h2>
+      <dl>
+        <dt>Screened as</dt><dd>${escapeHtml(or(screening.subject && screening.subject.displayName))} (${escapeHtml(human(screening.subject && screening.subject.subjectType))})</dd>
+        <dt>Countries · identifiers</dt><dd>${escapeHtml(((screening.subject && screening.subject.countries) || []).join(', ') || '—')} · ${escapeHtml(((screening.subject && screening.subject.identifiers) || []).map((i) => `${human(i.type)} ${i.value}`).join('; ') || '—')}</dd>
+        <dt>Records examined</dt><dd>${escapeHtml(screening.candidatesExamined != null ? Number(screening.candidatesExamined).toLocaleString() : '—')} (every record of the subject's type)</dd>
+        <dt>Deterministic status</dt><dd>${badge(screening.status)} · ${escapeHtml(hits.length)} candidate(s) above the name threshold</dd>
+        <dt>LLM overall status</dt><dd>${badge(aml.overallStatus)}</dd>
+        <dt>LLM rationale</dt><dd class="rationale">${escapeHtml(or(aml.rationale))}</dd>
+        <dt>Analyst action</dt><dd class="rationale">${escapeHtml(or(aml.analystAction))}</dd>
+      </dl>
+      <h3>Candidates and merge results</h3>
+      ${candidates || '<p>No sanctions-list record matched the subject above the name threshold.</p>'}
+
+      <h2>Primary AML concern</h2>
+      ${primary ? `<dl>
+        <dt>Candidate</dt><dd>${escapeHtml(primary.candidateName)} (${ofacLink(hits.find((h) => String(h.sourceRecordId) === String(primary.sourceRecordId)) || { entryId: primary.sourceRecordId })})</dd>
+        <dt>Confidence</dt><dd>${fmt(primary.confidenceScore)} ${badge(primary.confidenceLevel)}</dd>
+        <dt>Disposition</dt><dd>${badge(primary.recommendedDisposition)}</dd>
+        <dt>Rationale</dt><dd class="rationale">${escapeHtml(primary.rationale)}</dd>
+      </dl>` : '<p>None — no candidates.</p>'}
+
+      <h2>Pass 2: Final KYC risk after AML enrichment</h2>
+      <p>Final risk ${badge(final.overallRisk)} · score <b>${escapeHtml(or(final.score))}</b> · recommendation ${badge(kyc.recommendation)}</p>
+      <p class="rationale">${escapeHtml(final.rationale || '')}</p>
+      <h3>Final risk factors by category</h3>
+      ${factorsTable(final)}
+      <h3>Cross-factor weighted score (final)</h3>
+      ${scoreTable(final)}
+      <h3>Final score composition</h3>
+      <p class="note">Each slice is a factor's weighted points as a share of the total.</p>
+      ${pieChart(final)}
+
+      <h2>Required compliance actions</h2>
+      <dl>
+        <dt>Case recommendation</dt><dd>${badge(actions.caseRecommendation || kyc.recommendation)}</dd>
+        <dt>Manual AML disposition</dt><dd>${escapeHtml(or(actions.manualAmlDisposition))}</dd>
+        <dt>Periodic screening cadence</dt><dd>${escapeHtml(or(actions.periodicScreeningCadence))}</dd>
+        <dt>Enhanced due diligence</dt><dd>${escapeHtml(or(actions.eddAction))}</dd>
+      </dl>
+
+      <h2>Methodology</h2>
+      <p class="note">${escapeHtml(final.methodology || baseline.methodology || '')}</p>
+      <p class="note">Candidates remain possible matches until an analyst confirms or clears them; the KYC subject's identity is never overwritten by a sanctions record. The LLM disposition is analyst support, not the onboarding decision. Scoring weights, the country-risk table and matching thresholds are demo calibration values, not regulatory constants.</p>`;
+    return { html, subject: s.displayName || row.subject || row.caseId };
+  }
+
+  async function openReport(caseId) {
+    $('report-wrap').hidden = false;
+    $('report-error').hidden = true;
+    $('report').innerHTML = '';
+    current = null;
+    try {
+      const env = await reportRunner.view('KycCaseReport', { caseId }, { refresh: true });
+      if (!env) return;
+      const row = rowsOf(env)[0];
+      if (!row) {
+        $('report-error').hidden = false;
+        $('report-error').textContent = `Case ${caseId} was not found — it may have been deleted. Refresh the case list.`;
+        return;
+      }
+      const r = renderReport(row);
+      $('report').innerHTML = r.html;
+      current = { caseId, html: r.html, subject: r.subject };
+      $('report-wrap').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (e) {
+      $('report-error').hidden = false;
+      $('report-error').textContent = 'The report failed to load: ' + (e.message || e);
+    }
+  }
+
+  $('close-report').addEventListener('click', () => { $('report-wrap').hidden = true; current = null; });
+
+  // ── save ─────────────────────────────────────────────────────────────────────────────────
+  /* The report's own rules (the `.report` block), lifted from this page so the saved file looks
+     the same as the screen and stands alone — no theme, no runtime, nothing to fetch. */
+  function reportCss() {
+    const own = [...document.querySelectorAll('style')].map((s) => s.textContent).join('\n');
+    const start = own.indexOf('.report {');
+    const end = own.indexOf('@media print');
+    const rules = start >= 0 ? own.slice(start, end > start ? end : undefined) : '';
+    return 'body{margin:0;background:#f4f6f8;}\n' + rules +
+      '\n.report{max-width:900px;margin:24px auto;box-shadow:0 1px 4px rgba(0,0,0,.15);}' +
+      '\n@media print{body{background:#fff}.report{box-shadow:none;margin:0;max-width:none;padding:0}@page{margin:16mm 14mm}}';
+  }
+  const fileStem = () => 'kyc-aml-report-' + String(current.caseId).replace(/[^a-z0-9-]+/gi, '-').slice(0, 80);
+
+  $('save-html').addEventListener('click', () => {
+    if (!current) return;
+    const doc = '<!DOCTYPE html>\n<html lang="en"><head><meta charset="UTF-8">' +
+      '<meta name="viewport" content="width=device-width, initial-scale=1.0">' +
+      `<title>KYC AML report — ${escapeHtml(current.subject)}</title><style>${reportCss()}</style></head>` +
+      `<body><article class="report">${current.html}</article></body></html>`;
+    const url = URL.createObjectURL(new Blob([doc], { type: 'text/html' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileStem() + '.html';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  });
+
+  $('save-pdf').addEventListener('click', () => {
+    if (!current) return;
+    const title = document.title;
+    document.title = fileStem();              // the browser offers the title as the PDF's file name
+    document.body.classList.add('print-report');
+    const restore = () => {
+      document.body.classList.remove('print-report');
+      document.title = title;
+      window.removeEventListener('afterprint', restore);
+    };
+    window.addEventListener('afterprint', restore);
+    window.print();
+    setTimeout(restore, 1000);
+  });
+
+  // ── start ────────────────────────────────────────────────────────────────────────────────
+  (async () => {
+    if (!(await preflight())) { $('run').disabled = true; return; }
+    loadListStatus();
+    loadCases(false);
+    const want = new URLSearchParams(window.location.search).get('caseId');
+    if (want) openReport(want);
+  })();
+})();
+</script>
+
+<div id="embabel-badge" style="position:fixed;bottom:0;left:0;right:0;text-align:center;padding:6px 0;background:rgba(10,10,15,0.9);border-top:1px solid rgba(99,192,245,0.2);font-size:0.75rem;color:#6b7280;z-index:9999;pointer-events:none;">
+  Created with <a href="https://worlds.embabel.com" target="_blank" rel="noopener noreferrer" style="color:#63c0f5;text-decoration:none;pointer-events:auto;">Embabel Worlds</a>
+</div>
+</body>
+</html>

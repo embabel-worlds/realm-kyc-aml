@@ -1,0 +1,6 @@
+name: kyc-aml
+description: "KYC onboarding with AML sanctions screening. Extracts a legal-entity KycCase from an uploaded certificate, screens it against the OFAC SDN list loaded into the graph, has an LLM disposition each candidate, then recomputes risk (baseline vs AML-adjusted) and reports it. Port of the meta-agent kycdemo pipeline."
+version: 0.0.1
+author: "Igor Dayen"
+host: wasm
+tags: [kyc, aml, sanctions, compliance]

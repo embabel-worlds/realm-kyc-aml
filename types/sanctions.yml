@@ -1,0 +1,22 @@
+# Sanctions list data, seeded as SanctionsListShard reference records built from the published
+# file by scripts/build-ofac-reference.py. A matched record's details travel on its
+# ScreeningCandidate, so individual list records are never nodes.
+#
+# Why shards: the host upserts each reference record with a label scan, so one node per list
+# record (19k) seeds quadratically — about an hour, repeated on every world rebuild.
+- name: SanctionsListShard
+  userAnchor: false
+  description: "A slice (~50 records) of a published sanctions list, stored whole for the kyc-screen-certificate lens to read and fuzzy-match. Not for direct querying: screen through the lens; list which lists and publish dates are loaded with the SanctionsListsLoaded view."
+  properties:
+    shardId:
+      identity: true
+      description: "'<LIST>:<SUBJECT TYPE>:<n>', e.g. 'OFAC:LEGAL_ENTITY:07'."
+    source: "Which list: OFAC_SANCTIONS."
+    subjectType: "LEGAL_ENTITY (OFAC Entity) or PERSON (Individual, Vessel, Aircraft)."
+    listPublished: "Publish date of the list export."
+    entryCount:
+      type: int
+      description: "Records in this shard."
+    tokens: "Union of the shard's normalized name tokens, space-padded, for choosing which shards to read."
+    entriesJson: "The shard's records as a JSON array: entryId, sourceRecordId, name, sdnType, subjectType, aliases, countries, countryCodes, addresses, identifiers, dateOfBirth, programs, sourceUrl, listPublished."
+

@@ -1,0 +1,64 @@
+# The answer surface for screened KYC cases. Counts and detail are separate views: the case list
+# is triage across every case, the candidates view is the detail pane for one case.
+
+- name: KycCases
+  description: Every screened KYC case, newest first — subject, jurisdiction, baseline vs final (AML-adjusted) risk, recommendation, AML status and how many sanctions candidates it has. Start here; drill into one case with KycCaseCandidates.
+  params:
+    limit:
+      type: int
+      default: 50
+      description: "How many cases."
+  cypher: |
+    MATCH (k:KycCase)
+    RETURN k.caseId AS caseId, k.name AS subject, k.registrationNumber AS registrationNumber,
+           k.jurisdiction AS jurisdiction, k.baselineRisk AS baselineRisk, toInteger(k.baselineScore) AS baselineScore,
+           k.finalRisk AS finalRisk, toInteger(k.finalScore) AS finalScore, k.recommendation AS recommendation,
+           k.amlStatus AS amlStatus, toInteger(k.hitCount) AS sanctionsCandidates, k.primaryConcern AS primaryConcern,
+           k.documentUri AS document, k.screenedAt AS screenedAt
+    ORDER BY screenedAt DESC LIMIT $limit
+
+- name: KycCasesNeedingReview
+  description: Screened KYC cases an analyst still has to act on — any recommendation other than APPROVE (enhanced due diligence, manual review, reject), highest final risk score first.
+  cypher: |
+    MATCH (k:KycCase) WHERE k.recommendation <> 'APPROVE'
+    RETURN k.caseId AS caseId, k.name AS subject, k.finalRisk AS finalRisk, toInteger(k.finalScore) AS finalScore,
+           k.recommendation AS recommendation, k.amlStatus AS amlStatus, k.primaryConcern AS primaryConcern,
+           k.issueCodes AS issues
+    ORDER BY finalScore DESC, subject
+
+- name: KycCaseCandidates
+  description: The sanctions-list candidates for ONE KYC case (by caseId from KycCases) — listed name, the alias that matched, name and identifier scores, conflicting identifiers, and the LLM's confidence, disposition, rationale and missing evidence. Highest confidence first.
+  params:
+    caseId:
+      type: string
+      description: "The KycCase caseId."
+  cypher: |
+    MATCH (c:ScreeningCandidate) WHERE c.caseId = $caseId
+    RETURN c.entryId AS entryId, c.name AS listedName, c.matchedName AS matchedName, c.sdnType AS listType,
+           c.programs AS programs, c.countries AS listCountries, toFloat(c.nameScore) AS nameScore,
+           toFloat(c.identifierScore) AS identifierScore, c.conflicts AS conflicts,
+           c.deterministicDisposition AS matcherDisposition, toFloat(c.confidenceScore) AS confidence,
+           c.confidenceLevel AS confidenceLevel, c.disposition AS disposition, c.mergeTreatment AS mergeTreatment,
+           c.rationale AS rationale, c.missingEvidence AS missingEvidence
+    ORDER BY confidence DESC
+
+- name: SanctionsListsLoaded
+  description: Which sanctions lists this world screens against, their publish dates and how many records of each subject type are loaded. Use to check the list is current before trusting a CLEAR result.
+  cypher: |
+    MATCH (s:SanctionsListShard)
+    RETURN s.source AS list, s.listPublished AS published, s.subjectType AS subjectType,
+           count(s) AS shards, sum(toInteger(s.entryCount)) AS records
+    ORDER BY list, subjectType
+
+- name: KycCaseReport
+  description: Everything needed to render ONE screened case as a compliance report (by caseId from KycCases) — the headline fields plus the stored JSON of the amended case, both risk passes with their factor breakdowns, the screening result and the LLM disposition. For a table of cases use KycCases instead.
+  params:
+    caseId:
+      type: string
+      description: "The KycCase caseId."
+  cypher: |
+    MATCH (k:KycCase) WHERE k.caseId = $caseId
+    RETURN k.caseId AS caseId, k.name AS subject, k.documentName AS documentName, k.documentUri AS documentUri,
+           k.listPublished AS listPublished, k.screenedAt AS screenedAt, k.recommendation AS recommendation,
+           k.amlStatus AS amlStatus, k.caseJson AS caseJson, k.baselineRiskJson AS baselineRiskJson,
+           k.screeningJson AS screeningJson, k.amlAssessmentJson AS amlAssessmentJson, k.complianceJson AS complianceJson

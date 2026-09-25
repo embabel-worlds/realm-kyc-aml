@@ -1,0 +1,81 @@
+# A screened KYC case and its sanctions candidates, written by the kyc-aml-screening pipeline.
+# Headline fields are flat so views can filter and sort on them; the full nested case, risk passes
+# and screening payload ride along as JSON for the report app, which renders them whole.
+- name: KycCase
+  userAnchor:
+    predicate: SCREENED
+    direction: from-user
+  description: "A KYC onboarding case for one subject (usually a legal entity from a certificate of incorporation), after AML sanctions screening: baseline vs AML-adjusted risk, recommendation and AML status. Its sanctions candidates are ScreeningCandidate records with the same caseId."
+  properties:
+    caseId:
+      identity: true
+      description: "Stable case id: the subject's slug plus the source document's slug, so re-screening the same certificate updates the case."
+    name: "Subject display name as extracted from the document."
+    subjectType: "LEGAL_ENTITY or PERSON."
+    registrationNumber: "Company registration number as printed on the certificate."
+    jurisdiction: "Jurisdiction of incorporation, ISO 3166 alpha-2."
+    incorporationDate: "Incorporation date, ISO yyyy-mm-dd."
+    registeredOffice: "Registered office address, one line."
+    documentName: "Title of the ingested source document (Documents app) the case was extracted from."
+    documentUri: "URI of that document, e.g. upload://acme-certificate.pdf — identifies it exactly when titles repeat."
+    baselineRisk: "Pass 1 overall risk before AML: LOW, MEDIUM, HIGH or UNKNOWN."
+    baselineScore:
+      type: int
+      description: "Pass 1 weighted score, 0-100."
+    finalRisk: "Pass 2 overall risk after AML enrichment: LOW, MEDIUM, HIGH or UNKNOWN."
+    finalScore:
+      type: int
+      description: "Pass 2 weighted score, 0-100."
+    recommendation: "APPROVE, APPROVE_WITH_CONDITIONS, ENHANCED_DUE_DILIGENCE, MANUAL_REVIEW or REJECT."
+    amlStatus: "Subject-level AML status: CLEAR, MANUAL_REVIEW_REQUIRED or REJECT."
+    hitCount:
+      type: int
+      description: "Number of sanctions candidates above the name threshold."
+    primaryConcern: "Highest-confidence candidate's list name, empty when clear."
+    primaryConfidence:
+      type: number
+      description: "LLM confidence 0-1 for the primary concern."
+    issueCodes: "Data-quality issue codes, space separated (e.g. BENEFICIAL_OWNERSHIP_MISSING POSSIBLE_SANCTIONS_MATCH)."
+    listPublished: "Publish date of the sanctions list the case was screened against."
+    screenedAt: "When screening ran, ISO timestamp."
+    caseJson: "The amended KycCase (subject, evidence, screening results, final risk, issues) as JSON."
+    baselineRiskJson: "Pass 1 RiskAssessment with factors and score breakdown, as JSON."
+    screeningJson: "Sanctions screening result (subject, status, hits, records examined) as JSON."
+    amlAssessmentJson: "LLM AML disposition (per-candidate confidence, rationale, missing evidence) as JSON."
+    complianceJson: "Required compliance actions and merge decisions, as JSON."
+
+- name: ScreeningCandidate
+  userAnchor: false
+  description: "One sanctions-list record that matched a KycCase subject by name, with the list record's details, the deterministic scores and the LLM's disposition. Joins to its KycCase on caseId (MATCH (k:KycCase), (c:ScreeningCandidate) WHERE c.caseId = k.caseId)."
+  properties:
+    candidateId:
+      identity: true
+      description: "caseId + '|' + entryId."
+    caseId: "The KycCase this candidate belongs to."
+    entryId: "The matched list record, '<LIST>:<record id>', e.g. OFAC:23652."
+    source: "Which list: OFAC_SANCTIONS."
+    sourceRecordId: "The list's own record id (OFAC uid)."
+    sdnType: "List record type as published: Entity, Individual, Vessel or Aircraft."
+    aliases: "The list record's alias names, ' | ' separated."
+    countries: "The list record's ISO alpha-2 country codes, space separated."
+    addresses: "The list record's addresses, ' | ' separated."
+    identifiers: "The list record's identifiers as TYPE:COUNTRY:VALUE, space separated."
+    programs: "Sanctions programs, space separated."
+    name: "The list record's primary name."
+    matchedName: "The name or alias that matched the subject."
+    nameScore:
+      type: number
+      description: "Fuzzy name similarity 0-1 (token Jaccard or normalized edit distance, whichever is higher)."
+    identifierScore:
+      type: number
+      description: "Share of comparable identifiers (country, registration number, date of birth) that agree, 0-1."
+    conflicts: "Identifier kinds that disagree, space separated: country identifier dateOfBirth."
+    deterministicDisposition: "Matcher disposition before LLM review."
+    confidenceScore:
+      type: number
+      description: "LLM analyst confidence 0-1 that the subject IS this listed party."
+    confidenceLevel: "LOW, MEDIUM or HIGH."
+    disposition: "LLM recommended disposition: LIKELY_FALSE_POSITIVE, POSSIBLE_MATCH or CONFIRMED_MATCH."
+    mergeTreatment: "How the candidate was merged into the case, by confidence and disposition."
+    rationale: "LLM rationale."
+    missingEvidence: "Evidence the LLM says is needed to resolve the candidate, ' | ' separated."

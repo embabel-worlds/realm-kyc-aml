@@ -1,0 +1,407 @@
+id: kyc-screen-certificate
+name: KYC AML screening
+description: "Run the full KYC + AML pipeline on one uploaded certificate of incorporation: extract a KycCase from the document (LLM), score baseline risk, screen the subject against the loaded sanctions lists (OFAC SDN), have the LLM disposition each candidate, recompute AML-adjusted risk, and save the KycCase and its ScreeningCandidates. Takes the document's upload filename, URI or title."
+params:
+  - name: document
+    type: STRING
+    label: Certificate (upload filename, document URI, or title)
+    required: true
+spec:
+  kind: cypherscript
+  script: |
+    /*
+     * KYC + AML pipeline — orchestration of the kycdemo KycAmlRiskPipelineIntegrationTest.
+     *
+     * Risk scoring and case amendment are realm functions (gateway.kyc.*). The LLM steps and the
+     * sanctions matcher run here: a wasm handler cannot call the LLM, and scoring every list
+     * record there was measured at well over its 30s budget, where this sandbox takes well under
+     * a second. Nothing here is specific to one certificate: the document is resolved by what
+     * the user uploaded, the prompts carry rules rather than facts, and a clean screen (no
+     * candidates) is a normal outcome.
+     */
+    const args = typeof lensArgs !== "undefined" ? lensArgs : {};
+    const documentRef = String(args.document || "").trim();
+    if (!documentRef) throw new Error("document is required: the upload filename, document URI, or title");
+
+    const rows = (r) => (r && r.rows) ? r.rows : (r || []);
+    const slug = (s) => String(s || "").toLowerCase().normalize("NFD").replace(/\p{M}+/gu, "")
+      .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+    const say = async (message) => {
+      console.log(message);
+      try { await gateway.progress.report({ message }); } catch (e) { /* progress is best-effort */ }
+    };
+
+    /* Parse the model's JSON, tolerating a fenced block or prose around it. */
+    function parseJson(text, what) {
+      const s = String(text || "");
+      const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+      const body = fenced ? fenced[1] : s.slice(s.indexOf("{"), s.lastIndexOf("}") + 1);
+      try { return JSON.parse(body); } catch (e) {
+        throw new Error(`${what}: the model did not return valid JSON (${e.message}). Start of reply: ${s.slice(0, 300)}`);
+      }
+    }
+
+    // ── sanctions matcher (nameMatching.kt, ScreeningMatcher.kt, AmlScreeningService.kt) ────────
+    /* Demo calibration values (ScreeningMatchingPolicy), not regulatory constants. */
+    const MATCHING = {
+      possibleMatchNameThreshold: 0.72, confirmedNameThreshold: 0.95, confirmedIdentifierThreshold: 0.85,
+      nameConfidenceWeight: 0.65, identifierConfidenceWeight: 0.35, noComparableIdentifiersScore: 0.5,
+      falsePositiveConflictCount: 2,
+    };
+    /* Must match NOISE_WORDS in scripts/build-ofac-reference.py, which pre-tokenizes list names. */
+    const NOISE_WORDS = new Set(["limited", "ltd", "inc", "corp", "corporation", "company", "co", "plc", "llc"]);
+    const SCREENING_DESCRIPTION =
+      "Screens the subject against every record of its type on the sanctions lists loaded in this world (OFAC SDN), " +
+      "keeps candidate hits separate from final officer decisions, and uses fuzzy name matching over primary names and " +
+      "aliases plus available identifiers (date of birth, country, registration number) to classify each candidate as " +
+      "likely false positive, possible match, or confirmed match.";
+
+    function nameTokens(name) {
+      const s = String(name || "").normalize("NFD").replace(/\p{M}+/gu, "").toLowerCase().replace(/[^a-z0-9\s]+/g, " ");
+      const seen = [];
+      for (const t of s.split(/\s+/)) if (t && !NOISE_WORDS.has(t) && !seen.includes(t)) seen.push(t);
+      return seen;
+    }
+    function levenshtein(a, b) {
+      let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+      for (let i = 0; i < a.length; i++) {
+        const cur = [i + 1];
+        for (let j = 0; j < b.length; j++) cur[j + 1] = Math.min(cur[j] + 1, prev[j + 1] + 1, prev[j] + (a[i] === b[j] ? 0 : 1));
+        prev = cur;
+      }
+      return prev[b.length];
+    }
+    /*
+     * max(token Jaccard, normalized edit similarity). Levenshtein is skipped when its upper bound
+     * (1 - |length difference| / longer length) cannot beat max(floor, token score), so every score
+     * at or above the floor is exactly the unbounded formula's.
+     */
+    function tokenSimilarity(l, r, floor) {
+      if (!l.length || !r.length) return 0;
+      let inter = 0;
+      for (const t of l) if (r.includes(t)) inter++;
+      const tokenScore = inter / (l.length + r.length - inter);
+      const a = l.join(" "), b = r.join(" ");
+      const max = Math.max(a.length, b.length);
+      if (max === 0) return 1;
+      if (1 - Math.abs(a.length - b.length) / max <= Math.max(floor, tokenScore)) return tokenScore;
+      return Math.max(tokenScore, 1 - Math.min(levenshtein(a, b) / max, 1));
+    }
+    const splitCodes = (v) => String(v || "").split(/\s+/).filter(Boolean);
+    const splitList = (v) => String(v || "").split(" | ").map((x) => x.trim()).filter(Boolean);
+    const idKey = (i) => `${i.type}:${String(i.issuingCountry || "").toUpperCase()}:${String(i.value || "").toUpperCase().replace(/[^A-Z0-9]/g, "")}`;
+    function sameDate(a, b) {
+      const d = (x) => { const t = Date.parse(x); return isNaN(t) ? String(x).trim() : new Date(t).toISOString().slice(0, 10); };
+      return !!a && !!b && d(a) === d(b);
+    }
+
+    function matchEntry(subject, subjectIds, e) {
+      const aliases = splitList(e.aliases);
+      const names = [e.name, ...aliases];
+      const norm = e.normNames ? String(e.normNames).split("|") : names.map((n) => nameTokens(n).join(" "));
+      let best = null;
+      for (let i = 0; i < names.length; i++) {
+        const score = tokenSimilarity(subject.tokens, (norm[i] || "").split(" ").filter(Boolean),
+          best ? best.score : MATCHING.possibleMatchNameThreshold);
+        if (!best || score > best.score) best = { name: names[i], score };
+      }
+      if (!best || best.score < MATCHING.possibleMatchNameThreshold) return null;
+      const codes = splitCodes(e.countryCodes);
+      const ids = splitCodes(e.identifiers);
+      let matched = 0, compared = 0;
+      if (subject.dateOfBirth && e.dateOfBirth) { compared++; if (sameDate(subject.dateOfBirth, e.dateOfBirth)) matched++; }
+      if (subject.countries.length && codes.length) { compared++; if (subject.countries.some((c) => codes.includes(c))) matched++; }
+      if (subjectIds.length && ids.length) { compared++; if (subjectIds.some((i) => ids.includes(i))) matched++; }
+      const idScore = compared === 0 ? MATCHING.noComparableIdentifiersScore : matched / compared;
+      const conflicts = {
+        dateOfBirth: !!(subject.dateOfBirth && e.dateOfBirth && !sameDate(subject.dateOfBirth, e.dateOfBirth)),
+        country: subject.countries.length > 0 && codes.length > 0 && !subject.countries.some((c) => codes.includes(c)),
+        identifier: subjectIds.length > 0 && ids.length > 0 && !subjectIds.some((i) => ids.includes(i)),
+      };
+      const strong = sameDate(subject.dateOfBirth, e.dateOfBirth) || subjectIds.some((i) => ids.includes(i));
+      const disposition =
+        Object.values(conflicts).filter(Boolean).length >= MATCHING.falsePositiveConflictCount ? "LIKELY_FALSE_POSITIVE"
+        : best.score >= MATCHING.confirmedNameThreshold && idScore >= MATCHING.confirmedIdentifierThreshold && strong ? "CONFIRMED_MATCH"
+        : "POSSIBLE_MATCH";
+      const round2 = (x) => Math.round(x * 100) / 100;
+      return {
+        providerId: "ofac-reference", source: e.source || "OFAC_SANCTIONS", entryId: e.entryId, sourceRecordId: e.sourceRecordId,
+        matchedName: best.name, primaryName: e.name, aliases, sdnType: e.sdnType, subjectType: e.subjectType,
+        nameScore: round2(best.score), identifierScore: round2(idScore),
+        confidenceScore: round2(Math.min(1, Math.max(0, best.score * MATCHING.nameConfidenceWeight + idScore * MATCHING.identifierConfidenceWeight))),
+        countries: codes, countryNames: splitList(e.countries), addresses: splitList(e.addresses), identifiers: ids,
+        dateOfBirth: e.dateOfBirth || null, programs: splitCodes(e.programs),
+        conflicts: Object.keys(conflicts).filter((k) => conflicts[k]), disposition,
+        rationale: `Subject '${subject.displayName}' matched '${e.name}' using candidate name '${best.name}'. ` +
+          `Name score=${best.score.toFixed(2)}, identifier score=${idScore.toFixed(2)}, source=${e.source}, disposition=${disposition}.`,
+        sourceUrl: e.sourceUrl, listPublished: e.listPublished,
+      };
+    }
+
+    /* Scores EVERY list record of the subject's type, as OfacSanctionsXmlProvider.search does. */
+    async function screenSubject(subjectIn) {
+      const subject = { ...subjectIn, tokens: nameTokens(subjectIn.displayName) };
+      const subjectIds = (subject.identifiers || []).map(idKey);
+      const shards = rows(await gateway.kg.query({
+        cypher: `MATCH (s:SanctionsListShard) WHERE s.subjectType = $type RETURN s.entriesJson AS j, s.listPublished AS published`,
+        params: JSON.stringify({ type: subject.subjectType }),
+      }));
+      if (!shards.length) throw new Error("No sanctions list is loaded (no SanctionsListShard records) — refresh the kyc-aml realm.");
+      const priority = { CONFIRMED_MATCH: 3, POSSIBLE_MATCH: 2, LIKELY_FALSE_POSITIVE: 1 };
+      let examined = 0;
+      const hits = [];
+      for (const shard of shards) {
+        for (const e of JSON.parse(shard.j)) {
+          examined++;
+          const hit = matchEntry(subject, subjectIds, e);
+          if (hit) hits.push(hit);
+        }
+      }
+      hits.sort((a, b) => (priority[b.disposition] - priority[a.disposition]) || (b.confidenceScore - a.confidenceScore) || a.source.localeCompare(b.source));
+      const { tokens, ...plainSubject } = subject;
+      return {
+        subject: plainSubject,
+        status: hits.some((h) => h.disposition === "CONFIRMED_MATCH") ? "REJECT"
+          : hits.some((h) => h.disposition === "POSSIBLE_MATCH") ? "MANUAL_REVIEW_REQUIRED" : "CLEAR",
+        hits,
+        candidatesExamined: examined,
+        listPublished: shards[0].published,
+        screenedAt: new Date().toISOString(),
+        methodology: SCREENING_DESCRIPTION,
+      };
+    }
+
+    // ── 1. resolve the document and read its full text ──────────────────────────────────────
+    const docs = rows(await gateway.kg.query({
+      cypher: `MATCH (d:Document)
+               WHERE d.uri = $ref OR d.uri = 'upload://' + $ref OR d.title = $ref OR d.source_name = $ref
+               RETURN d.uri AS uri, d.title AS title, d.ingestionEpochMs AS at
+               ORDER BY at DESC`,
+      params: JSON.stringify({ ref: documentRef }),
+    }));
+    const uris = [...new Set(docs.map((d) => d.uri))];
+    if (!uris.length) {
+      throw new Error(`No ingested document matches '${documentRef}'. Upload the certificate in the Documents app, then pass its file name (e.g. acme-certificate.pdf).`);
+    }
+    if (uris.length > 1) {
+      throw new Error(`'${documentRef}' matches ${uris.length} documents: ${uris.join(", ")}. Pass one of these URIs instead.`);
+    }
+    const doc = docs[0];
+    /*
+     * Not `root_document_uri = $uri`: inside a query the engine sees a scoped form of that
+     * property (68 characters where 51 are returned), and no predicate containing the
+     * "upload://" scheme matches it. The scheme-less tail does, and the exact check on the
+     * RETURNED value keeps a longer URI that merely ends the same way from being mixed in.
+     */
+    const chunks = rows(await gateway.kg.query({
+      cypher: `MATCH (c:Chunk) WHERE c.source = 'document' AND c.root_document_uri ENDS WITH $tail
+               RETURN c.root_document_uri AS root, coalesce(c.urtext, c.text) AS text, c.chunk_index AS i ORDER BY i`,
+      params: JSON.stringify({ tail: doc.uri.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "") }),
+    })).filter((c) => c.root === doc.uri);
+    const documentText = chunks.map((c) => c.text).join("\n\n").trim();
+    if (!documentText) throw new Error(`Document ${doc.uri} has no text chunks; was it ingested successfully?`);
+    await say(`Read '${doc.title}' (${doc.uri}): ${documentText.length} characters.`);
+
+    // ── 2. LLM call 1: document -> KycCase ──────────────────────────────────────────────────
+    const extractionPrompt = `You are a KYC extraction agent. Map the certificate below into ONE KycCase JSON object.
+    Use only facts the document states. Never invent directors, owners, screening results, source of funds or source of wealth.
+
+    Rules:
+    - The primary legal entity the certificate is about is the KYC customer (subject).
+    - subject.partyType is "legalEntity"; subject.roles is ["CUSTOMER"]; subject.id is the slug of the display name.
+    - subject.displayName is the entity's legal name exactly as printed (keep "LIMITED", "LTD" etc.).
+    - subject.registrationNumber: the company / registration / incorporation number as printed, or null.
+    - subject.jurisdictionOfIncorporation: ISO 3166-1 alpha-2 code (e.g. "HK", "GB", "KY"), or null if not stated.
+    - subject.incorporationDate: ISO yyyy-mm-dd, or null.
+    - subject.addresses: the registered office as [{line1, line2, city, region, postalCode, countryCode}] (countryCode ISO alpha-2); [] if none.
+    - evidence: one entry {documentId, type:"CERTIFICATE_OF_INCORPORATION", fileName, issuer, issuePlace, issueDate} for this document
+      (documentId and fileName: "${doc.uri}"; issuer/issuePlace/issueDate from the document or null).
+      If the document is NOT a certificate of incorporation, use the closest DocumentType instead:
+      PASSPORT, NATIONAL_ID, PROOF_OF_ADDRESS, SHAREHOLDER_REGISTER, ARTICLES_OF_ASSOCIATION, TAX_DOCUMENT, OTHER.
+    - relatedParties: directors/officers/shareholders ONLY if named in the document, as {partyType:"person", id, displayName, roles:["DIRECTOR"|"BENEFICIAL_OWNER"|"AUTHORIZED_SIGNATORY"]}.
+    - ownership: [] unless the document states ownership percentages.
+    - screeningResults: [].
+    - issues: data-quality issues as {severity:"INFO"|"WARNING"|"ERROR", code, message, fieldPath}.
+      Add BENEFICIAL_OWNERSHIP_MISSING (WARNING, fieldPath "ownership") when no ownership evidence is present.
+      Add a WARNING for any field that is unreadable or ambiguous rather than guessing it.
+    - recommendation: "MANUAL_REVIEW".
+    - caseId: "".
+
+    Reply with the JSON object only.
+
+    Example of the SHAPE only (values are not about this document):
+    {"caseId":"","subject":{"partyType":"legalEntity","id":"example-holdings-limited","displayName":"Example Holdings Limited","registrationNumber":"EXAMPLE-123","jurisdictionOfIncorporation":"GB","incorporationDate":"2020-01-15","addresses":[{"line1":"1 Registry Street","line2":null,"city":"London","region":null,"postalCode":"EC1A 1AA","countryCode":"GB"}],"roles":["CUSTOMER"]},"relatedParties":[],"ownership":[],"evidence":[{"documentId":"upload://example-certificate.pdf","type":"CERTIFICATE_OF_INCORPORATION","fileName":"upload://example-certificate.pdf","issuer":"Example Companies Registry","issuePlace":"London","issueDate":"2020-01-15"}],"screeningResults":[],"recommendation":"MANUAL_REVIEW","issues":[{"severity":"WARNING","code":"BENEFICIAL_OWNERSHIP_MISSING","message":"Beneficial ownership evidence is missing from the supplied certificate-only KYC package.","fieldPath":"ownership"}]}
+
+    Document (${doc.uri}):
+    """
+    ${documentText.slice(0, 20000)}
+    """`;
+    const kycCase = parseJson(await gateway.ai.complete({ prompt: extractionPrompt, role: "best" }), "KycCase extraction");
+    if (!kycCase.subject || !String(kycCase.subject.displayName || "").trim()) {
+      throw new Error(`Could not identify the subject entity in ${doc.uri}; is this a certificate of incorporation?`);
+    }
+    kycCase.subject.partyType = kycCase.subject.partyType || "legalEntity";
+    kycCase.caseId = `${slug(kycCase.subject.displayName)}--${slug(doc.uri.replace(/^[a-z]+:\/\//, ""))}`;
+    for (const k of ["relatedParties", "ownership", "evidence", "screeningResults", "issues"]) kycCase[k] = kycCase[k] || [];
+    await say(`Extracted ${kycCase.subject.displayName} (${kycCase.subject.registrationNumber || "no registration number"}, ${kycCase.subject.jurisdictionOfIncorporation || "jurisdiction not stated"}).`);
+
+    // ── 3. baseline risk (pass 1) ───────────────────────────────────────────────────────────
+    const baseline = await gateway.kyc.assessBaselineRisk({ kycCase });
+    const baselineCase = { ...kycCase, riskAssessment: baseline.riskAssessment, recommendation: "MANUAL_REVIEW", issues: baseline.issues };
+    await say(`Baseline risk ${baseline.riskAssessment.overallRisk} (${baseline.riskAssessment.score}).`);
+
+    // ── 4. deterministic sanctions screening ────────────────────────────────────────────────
+    const screening = await screenSubject(baseline.screeningSubject);
+    await say(`Screened against ${screening.candidatesExamined} ${screening.subject.subjectType} list records (published ${screening.listPublished}): ${screening.hits.length} candidate(s), ${screening.status}.`);
+
+    // ── 5. LLM call 2: candidate disposition ────────────────────────────────────────────────
+    let amlAssessment = {
+      subjectName: screening.subject.displayName,
+      overallStatus: "CLEAR",
+      candidateAssessments: [],
+      rationale: "No sanctions list record matched the subject above the name threshold.",
+      analystAction: "No AML disposition required; screen again at each list update.",
+    };
+    if (screening.hits.length) {
+      const evidence = screening.hits.map((h) => `Candidate:
+    Record ID (copy this value verbatim as sourceRecordId): ${h.sourceRecordId}
+    Primary name: ${h.primaryName}
+    Matched list alias/name: ${h.matchedName}
+    List type: ${h.sdnType || "unknown"}; programs: ${h.programs.join(" ") || "none listed"}
+    List countries: ${h.countries.join(", ") || "none listed"}
+    List identifiers: ${h.identifiers.join(" ") || "none listed"}
+    List addresses: ${h.addresses.join(" | ") || "none listed"}
+    Deterministic name score: ${h.nameScore}; identifier score: ${h.identifierScore}; conflicting identifier kinds: ${h.conflicts.join(", ") || "none"}
+    Deterministic disposition: ${h.disposition}
+    Deterministic rationale: ${h.rationale}`).join("\n\n");
+      const dispositionPrompt = `You are assisting an AML analyst with case disposition for sanctions screening hits.
+
+    Apply these logical rules. Do not use numeric weights:
+    - Assess each candidate separately because the KYC subject may or may not be the same entity as any individual sanctions candidate.
+    - A near-exact legal name or sanctions-list alias match is material and must not be ignored.
+    - Missing company registration-number agreement prevents confirming the match.
+    - Conflicting jurisdiction or country evidence lowers confidence.
+    - Do not recommend CONFIRMED_MATCH unless strong secondary identifiers agree.
+    - Do not recommend LIKELY_FALSE_POSITIVE when the name or alias evidence is very strong and the only problems are missing or conflicting secondary evidence.
+    - Compute confidenceScore yourself as a number from 0.0 to 1.0 using the logical evidence. It is an analyst estimate, not a matcher score.
+    - Return exactly one candidate assessment for each candidate listed below.
+
+    Subject legal name: ${screening.subject.displayName}
+    Subject jurisdiction: ${screening.subject.countries.join(", ") || "not stated"}
+    Subject registration number: ${screening.subject.identifiers.map((i) => i.value).join(", ") || "not stated"}
+    Subject registered office: ${(kycCase.subject.addresses || []).map((a) => [a.line1, a.line2, a.city, a.postalCode, a.countryCode].filter(Boolean).join(", ")).join(" | ") || "not stated"}
+    Overall deterministic status: ${screening.status}
+
+    ${evidence}
+
+    Reply with ONE JSON object only:
+    {"subjectName": string, "overallStatus": "CLEAR"|"MANUAL_REVIEW_REQUIRED"|"REJECT", "rationale": string, "analystAction": string,
+     "candidateAssessments": [{"sourceRecordId": string (copied exactly from the candidate above), "candidateName": string,
+       "confidenceScore": number, "confidenceLevel": "LOW"|"MEDIUM"|"HIGH",
+       "recommendedDisposition": "LIKELY_FALSE_POSITIVE"|"POSSIBLE_MATCH"|"CONFIRMED_MATCH",
+       "rationale": string, "missingEvidence": [string]}]}`;
+      amlAssessment = parseJson(await gateway.ai.complete({ prompt: dispositionPrompt, role: "best" }), "AML disposition");
+      const assessed = new Set((amlAssessment.candidateAssessments || []).map((c) => String(c.sourceRecordId)));
+      const missing = screening.hits.filter((h) => !assessed.has(h.sourceRecordId));
+      if (missing.length) {
+        /* Never drop a hit the model skipped: it stays a possible match for the analyst. */
+        amlAssessment.candidateAssessments = (amlAssessment.candidateAssessments || []).concat(missing.map((h) => ({
+          sourceRecordId: h.sourceRecordId, candidateName: h.primaryName, confidenceScore: h.confidenceScore,
+          confidenceLevel: "MEDIUM", recommendedDisposition: "POSSIBLE_MATCH",
+          rationale: "Not assessed by the model; retained as a possible match for analyst review.", missingEvidence: [],
+        })));
+      }
+      await say(`AML disposition: ${amlAssessment.overallStatus}.`);
+    }
+
+    // ── 6. amend + final risk (pass 2) ──────────────────────────────────────────────────────
+    const amended = await gateway.kyc.amendCase({ kycCase: baselineCase, screening, amlAssessment });
+    const finalRisk = amended.kycCase.riskAssessment;
+    await say(`Final risk ${finalRisk.overallRisk} (${finalRisk.score}); recommendation ${amended.kycCase.recommendation}.`);
+
+    // ── 7. persist ──────────────────────────────────────────────────────────────────────────
+    const s = amended.kycCase.subject;
+    const office = (s.addresses || [])[0];
+    const primary = amended.primaryConcern;
+    const caseRow = {
+      caseId: kycCase.caseId,
+      name: s.displayName,
+      subjectType: screening.subject.subjectType,
+      registrationNumber: s.registrationNumber || "",
+      jurisdiction: screening.subject.countries[0] || "",
+      incorporationDate: s.incorporationDate || "",
+      registeredOffice: office ? [office.line1, office.line2, office.city, office.region, office.postalCode, office.countryCode].filter(Boolean).join(", ") : "",
+      documentName: doc.title,
+      documentUri: doc.uri,
+      baselineRisk: baseline.riskAssessment.overallRisk,
+      baselineScore: baseline.riskAssessment.score,
+      finalRisk: finalRisk.overallRisk,
+      finalScore: finalRisk.score,
+      recommendation: amended.kycCase.recommendation,
+      amlStatus: amended.amlStatus,
+      hitCount: screening.hits.length,
+      primaryConcern: primary ? primary.candidateName : "",
+      primaryConfidence: primary ? primary.confidenceScore : 0,
+      issueCodes: amended.kycCase.issues.map((i) => i.code).join(" "),
+      listPublished: screening.listPublished || "",
+      screenedAt: screening.screenedAt,
+      caseJson: JSON.stringify(amended.kycCase),
+      baselineRiskJson: JSON.stringify(baseline.riskAssessment),
+      screeningJson: JSON.stringify(screening),
+      amlAssessmentJson: JSON.stringify(amlAssessment),
+      complianceJson: JSON.stringify({ complianceActions: amended.complianceActions, mergeDecisions: amended.mergeDecisions, primaryConcern: primary }),
+    };
+    const candidateRows = amended.mergeDecisions.map((m) => {
+      const h = screening.hits.find((x) => x.sourceRecordId === m.sourceRecordId);
+      return {
+        candidateId: `${kycCase.caseId}|${h.entryId}`,
+        caseId: kycCase.caseId,
+        entryId: h.entryId,
+        source: h.source,
+        sourceRecordId: h.sourceRecordId,
+        sdnType: h.sdnType || "",
+        name: h.primaryName,
+        aliases: (h.aliases || []).join(" | "),
+        countries: h.countries.join(" "),
+        addresses: h.addresses.join(" | "),
+        identifiers: h.identifiers.join(" "),
+        programs: h.programs.join(" "),
+        matchedName: h.matchedName,
+        nameScore: h.nameScore,
+        identifierScore: h.identifierScore,
+        conflicts: h.conflicts.join(" "),
+        deterministicDisposition: h.disposition,
+        confidenceScore: m.confidenceScore,
+        confidenceLevel: m.confidenceLevel,
+        disposition: m.recommendedDisposition,
+        mergeTreatment: m.treatment,
+        rationale: (amlAssessment.candidateAssessments.find((c) => String(c.sourceRecordId) === m.sourceRecordId) || {}).rationale || "",
+        missingEvidence: (m.missingEvidence || []).join(" | "),
+      };
+    });
+    if (typeof dryRun !== "undefined" && dryRun) {
+      console.log(`dry run: WOULD save KycCase ${caseRow.caseId} and ${candidateRows.length} ScreeningCandidate(s)`);
+    } else {
+      await gateway.repository.createEntry({ type: "KycCase", data: caseRow });
+      if (candidateRows.length) await gateway.repository.createEntries({ type: "ScreeningCandidate", rows: candidateRows });
+    }
+
+    const summary = {
+      caseId: caseRow.caseId,
+      subject: caseRow.name,
+      document: doc.uri,
+      baseline: `${caseRow.baselineRisk} (${caseRow.baselineScore})`,
+      final: `${caseRow.finalRisk} (${caseRow.finalScore})`,
+      recommendation: caseRow.recommendation,
+      amlStatus: caseRow.amlStatus,
+      candidates: candidateRows.map((c) => `${c.entryId} ${c.name} via '${c.matchedName}': ${c.confidenceScore}/${c.confidenceLevel} ${c.disposition}`),
+      issues: caseRow.issueCodes,
+      complianceActions: amended.complianceActions,
+      report: `/apps/kyc-aml/kyc-report.html?caseId=${encodeURIComponent(caseRow.caseId)}`,
+    };
+    console.log(JSON.stringify(summary, null, 2));
+    if (typeof lensArgs !== "undefined") {
+      await gateway.lens.present({ content: JSON.stringify({ kind: "kyc-case", ...summary }) });
+    }
+presentation:
+  href: /apps/kyc-aml/kyc-report.html

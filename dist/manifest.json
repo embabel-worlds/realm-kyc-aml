@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "generatedAt": "2026-09-22T00:00:00Z",
+  "entries": [
+    {
+      "namespace": "kyc",
+      "name": "assessBaselineRisk",
+      "description": "Pass 1 of the KYC risk pipeline: deterministic pre-screening risk for a KycCase (geography, ownership, document quality, source of funds, source of wealth, sanctions=UNKNOWN until screened). Also returns required-field issues and the normalized screeningSubject (ISO country codes, typed identifiers) to screen.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kycCase": {
+            "type": "object",
+            "description": "A KycCase: { caseId, subject: { partyType: 'legalEntity'|'person', id, displayName, registrationNumber?, jurisdictionOfIncorporation? (ISO alpha-2), incorporationDate?, addresses[], roles[] }, relatedParties[], ownership[], evidence[{ documentId, type, fileName, issuer?, issuePlace?, issueDate? }], screeningResults[], issues[] }."
+          }
+        },
+        "required": [
+          "kycCase"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "riskAssessment": {
+            "type": "object"
+          },
+          "issues": {
+            "type": "array"
+          },
+          "screeningSubject": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    {
+      "namespace": "kyc",
+      "name": "amendCase",
+      "description": "Pass 2 of the KYC risk pipeline: amend a KycCase with sanctions screening results and the LLM's per-candidate disposition, apply merge treatment by confidence, replace the pre-screening sanctions factor, recompute final risk and score, and derive the recommendation, issues and required compliance actions. Works with zero candidates (clean screen).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "kycCase": {
+            "type": "object",
+            "description": "The KycCase as extracted (baseline)."
+          },
+          "screening": {
+            "type": "object",
+            "description": "The sanctions screening result: { subject, status: 'CLEAR'|'MANUAL_REVIEW_REQUIRED'|'REJECT', hits: [{ entryId, sourceRecordId, source, primaryName, matchedName, addresses[], identifiers[], ... }], candidatesExamined } — as produced by the kyc-screen-certificate lens."
+          },
+          "amlAssessment": {
+            "type": "object",
+            "description": "LLM disposition: { subjectName, overallStatus: 'CLEAR'|'MANUAL_REVIEW_REQUIRED'|'REJECT', rationale, analystAction, candidateAssessments: [{ sourceRecordId, candidateName, confidenceScore 0..1, confidenceLevel: 'LOW'|'MEDIUM'|'HIGH', recommendedDisposition: 'LIKELY_FALSE_POSITIVE'|'POSSIBLE_MATCH'|'CONFIRMED_MATCH', rationale, missingEvidence: string[] }] }. Omit or pass no candidates for a clean screen."
+          }
+        },
+        "required": [
+          "kycCase",
+          "screening"
+        ]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "kycCase": {
+            "type": "object"
+          },
+          "amlStatus": {
+            "type": "string"
+          },
+          "primaryConcern": {
+            "type": "object"
+          },
+          "mergeDecisions": {
+            "type": "array"
+          },
+          "complianceActions": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  ]
+}
