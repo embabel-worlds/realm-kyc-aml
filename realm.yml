@@ -3,4 +3,5 @@ description: "KYC onboarding with AML sanctions screening. Extracts a legal-enti
 version: 0.0.1
 author: "Igor Dayen"
 host: wasm
+category: compliance
 tags: [kyc, aml, sanctions, compliance]
